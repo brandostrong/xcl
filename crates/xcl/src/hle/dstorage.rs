@@ -248,11 +248,36 @@ pub struct BcpackUnpackStats {
     pub failed: u64,
 }
 
+/// Diagnostic: `XCL_DSTORAGE_BCPACK=0` fails BCPack requests before the decoder.
+fn bcpack_disabled() -> bool {
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OFF.get_or_init(|| std::env::var("XCL_DSTORAGE_BCPACK").is_ok_and(|v| v == "0"))
+}
+
+static DECODE_NS: AtomicU64 = AtomicU64::new(0);
+static DECODE_BYTES: AtomicU64 = AtomicU64::new(0);
+static DECODE_CALLS: AtomicU64 = AtomicU64::new(0);
+
 /// The BCPack stage of a request: `packed` to the `n` bytes of blocks of its mode.
 fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESULT> {
     let bc = r.bcpack();
     let i = bc as usize & 0xF;
-    match super::bcpack::decode(bc, packed, n) {
+    if bcpack_disabled() {
+        return Err(E_DECOMPRESSION);
+    }
+    let started = std::time::Instant::now();
+    let decoded = super::bcpack::decode(bc, packed, n);
+    let ns = started.elapsed().as_nanos() as u64;
+    DECODE_NS.fetch_add(ns, Ordering::Relaxed);
+    DECODE_BYTES.fetch_add(n as u64, Ordering::Relaxed);
+    let calls = DECODE_CALLS.fetch_add(1, Ordering::Relaxed) + 1;
+    if calls % 128 == 0 {
+        let total_ns = DECODE_NS.load(Ordering::Relaxed);
+        let total_mb = DECODE_BYTES.load(Ordering::Relaxed) as f64 / 1e6;
+        let rate = if total_ns == 0 { 0.0 } else { total_mb / (total_ns as f64 / 1e9) };
+        crate::xlog_info!("DirectStorage: BCPack decode: {calls} calls, {total_mb:.1} MB, {:.2} s, {rate:.1} MB/s", total_ns as f64 / 1e9);
+    }
+    match decoded {
         Ok(blocks) => {
             if UNPACKED.requests[i].fetch_add(1, Ordering::Relaxed) == 0 {
                 crate::xlog_info!("DirectStorage: BCPack {}: first request unpacked ({} to {n} bytes)", bcpack_name(bc), packed.len());
