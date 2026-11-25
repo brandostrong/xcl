@@ -4685,7 +4685,7 @@ impl Em {
             h.push_str(PRELUDE_PIXEL);
         }
         if self.x64() {
-            self.x64_prelude(&mut h, outline);
+            self.x64_prelude(&mut h, outline && outline_exchange());
         }
         if let Some(u) = &self.upper {
             // wave64 VS / PS on a GPU with 32-lane waves only (`upper_lanes`)
@@ -5585,6 +5585,12 @@ fn windowed(h: &str, windows: u32, heap: Option<&str>, outline: bool) -> String 
     }
     out.push_str(rest);
     out.replacen(MEM_ACCESSORS_HERE, &mem_accessors(windows, heap, outline), 1)
+}
+
+/// `XCL_OUTLINE_EXCHANGE=0`: keep the split-wave64 rendezvous inline. Outlined it builds
+/// faster but costs dispatch time in loops that read lanes (measured on #1901, RTX 4090).
+fn outline_exchange() -> bool {
+    !std::env::var("XCL_OUTLINE_EXCHANGE").is_ok_and(|v| v.trim() == "0")
 }
 
 // SM 6.6 DXIL retains scalar calls. Vector accessors use scalar out parameters below
