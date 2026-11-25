@@ -79,6 +79,11 @@ mod heap_window_tests;
 /// (`console_heap::null_views`).
 pub const MEM_HEAP_BASE: u32 = 4;
 
+/// Descriptors just past the window slots, for out-of-window heap accesses (`Options::heap_windows`):
+/// `MEM_NULL_LOAD` reads 0, `MEM_NULL_STORE` discards writes; made by `console_heap::null_window_views`.
+pub const MEM_NULL_LOAD: u32 = MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32;
+pub const MEM_NULL_STORE: u32 = MEM_NULL_LOAD + 1;
+
 /// Flag in a memory-windows count (`pso::mem_windows`, the translation caches' keys):
 /// `Options::heap_windows`. `translate` takes it out of `mem_windows`.
 pub const HEAP_WINDOWS: u32 = 0x100;
@@ -526,11 +531,15 @@ pub struct Options {
     /// structured control flow when the program allows it (false, or `XCL_RECOMP_NO_STRUCTURED`:
     /// always the guarded block chain)
     pub structured: bool,
+    /// force the un-remapped compute form (ratio 1, spin kept) even for a wave-local program:
+    /// the indirect-dispatch fallback PSO, whose group counts come from the title's buffer and
+    /// so cannot be scaled by the remap ratio
+    pub no_remap: bool,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true }
+        Options { mode: Mode::Kernel, wave64: true, hw_wave: 0, split_wave64: false, static_sampler_base: 0, mem_windows: 1, heap_windows: false, structured: true, no_remap: false }
     }
 }
 
@@ -550,6 +559,10 @@ pub struct Translation {
     /// console root signature's static samplers): (S#, comparison), register
     /// `static_sampler_base + i` in space 1
     pub static_samplers: Vec<([u32; 4], bool)>,
+    /// wave-local remap: hardware groups per console group and the console dimension it scales;
+    /// `(1, 0)` when not remapped
+    pub dispatch_ratio: u32,
+    pub dispatch_dim: u32,
 }
 
 impl Translation {
@@ -1614,7 +1627,8 @@ pub fn translate(code: &[u8], opt: &Options) -> Result<Translation, String> {
     }
     let hlsl = em.finish(&body);
     let static_samplers = em.static_used.clone();
-    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers })
+    let (dispatch_ratio, dispatch_dim) = em.remap().map_or((1, 0), |(r, d, _)| (r, d as u32));
+    Ok(Translation { hlsl, unsupported: em.unsupported, unsupported_why: em.unsupported_why, ignored: em.ignored, instructions: insts.len(), blocks, static_samplers, dispatch_ratio, dispatch_dim })
 }
 
 #[cfg(test)]

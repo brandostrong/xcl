@@ -7159,7 +7159,7 @@ fn gpu_split_wave64_local_and_exchanged_masks_in_diverging_waves() {
         io[1] = dims[0];
         io[2] = dims[0] * dims[1];
         let groups = 3usize;
-        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 256 * 16) / 4]).unwrap();
+        let out = runner::dispatch_r(&dxil, [groups as u32, 1, 1], t.dispatch_ratio, t.dispatch_dim as usize, &io, &vec![0u32; (base + groups * 256 * 16) / 4]).unwrap();
         for g in 0..groups {
             for tid in 0..threads as usize {
                 let (w, l) = (tid / 64, (tid % 64) as u32);
@@ -7227,7 +7227,7 @@ fn gpu_split_wave64_waves_diverge() {
         let opt = on_gpu(Options { mode: Mode::Compute(cs), wave64: true, ..Default::default() });
         let t = translate(&p, &opt).unwrap();
         assert!(t.complete(), "{:?}", t.unsupported_why);
-        if runner::split_wave64() && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
+        if runner::split_wave64() && t.dispatch_ratio == 1 && std::env::var("XCL_WAVE64_SPIN").map_or(true, |v| v.trim() != "0") {
             assert!(t.hlsl.contains("[WaveSize(32)]") && t.hlsl.contains("#define XCL_X_SPIN 1"), "{dims:?}");
         }
         let dxil = direct_or(&p, &opt, dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}")));
@@ -7237,7 +7237,7 @@ fn gpu_split_wave64_waves_diverge() {
         io[1] = dims[0];
         io[2] = dims[0] * dims[1];
         let groups = 3usize;
-        let out = runner::dispatch(&dxil, [groups as u32, 1, 1], &io, &vec![0u32; (base + groups * 256 * 8) / 4]).unwrap();
+        let out = runner::dispatch_r(&dxil, [groups as u32, 1, 1], t.dispatch_ratio, t.dispatch_dim as usize, &io, &vec![0u32; (base + groups * 256 * 8) / 4]).unwrap();
         for g in 0..groups {
             for tid in 0..threads as usize {
                 let (w, l) = (tid / 64, tid % 64);
@@ -7248,6 +7248,71 @@ fn gpu_split_wave64_waves_diverge() {
             }
         }
     }
+}
+
+/// The wave-local remap decision (no GPU): a compute program sharing nothing across its console
+/// waves gets one console wave per group; `dispatch_ratio` / `dispatch_dim` drive the launch.
+#[test]
+fn wave_local_remap_decision() {
+    use super::{CsInterface, Mode, Options};
+    let store = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 0), ("SADDR", 0x7D)], None),
+    ]);
+    let cs = |threads: [u32; 3]| CsInterface { threads, user_sgprs: 2, tgid: [false; 3], tg_size: false, tid_components: 3 };
+    let tr = |code: &[u8], threads: [u32; 3]| {
+        let opt = Options { mode: Mode::Compute(cs(threads)), wave64: true, split_wave64: true, ..Default::default() };
+        translate(code, &opt).unwrap()
+    };
+    // wave-local: one console wave per group (waves 1, spin off), the runtime scales `dim` by `ratio`
+    for (threads, ratio, dim, nt) in [
+        ([128u32, 1, 1], 2u32, 0usize, "numthreads(64, 1, 1)"),
+        ([8, 16, 1], 2, 1, "numthreads(8, 8, 1)"),
+        ([256, 1, 1], 4, 0, "numthreads(64, 1, 1)"),
+        ([64, 2, 1], 2, 1, "numthreads(64, 1, 1)"),
+    ] {
+        let t = tr(&store, threads);
+        assert!(t.complete(), "{threads:?}: {:?}", t.unsupported_why);
+        assert_eq!((t.dispatch_ratio, t.dispatch_dim), (ratio, dim as u32), "{threads:?}");
+        assert!(t.hlsl.contains(nt), "{threads:?}: {nt}");
+        assert!(t.hlsl.contains("#define XCL_X_WAVES 1u\n#define XCL_X_SLOT"), "{threads:?}: one console wave per group");
+        assert!(t.hlsl.contains("#define XCL_X_SPIN 0"), "{threads:?}: spin must be off");
+    }
+    // not remapped (ratio 1): one wave, a group that is not a multiple of 64, a 3-D group, or
+    // state shared across console waves (`s_barrier` or LDS) – the sharing instruction goes before
+    // `ENDPGM` (`prog` adds it), so the scan sees it
+    let barrier = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("S_BARRIER", "ENC_SOPP", &[], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 0), ("SADDR", 0x7D)], None),
+    ]);
+    let lds = prog(&[
+        ("V_LSHLREV_B32", "ENC_VOP2", &[("VDST", 6), ("SRC0", 130), ("VSRC1", 0)], None),
+        ("DS_WRITE_B32", "ENC_DS", &[("ADDR", 1), ("DATA0", 0)], None),
+        ("V_MOV_B32", "ENC_VOP1", &[("VDST", 7), ("SRC0", 128)], None),
+        ("GLOBAL_STORE_DWORD", "ENC_FLAT_GLBL", &[("ADDR", 6), ("DATA", 0), ("SADDR", 0x7D)], None),
+    ]);
+    for (code, threads, why) in [
+        (&store[..], [64u32, 1, 1], "one console wave"),
+        (&store[..], [96, 1, 1], "not a multiple of 64"),
+        (&store[..], [8, 8, 4], "3-D group"),
+        (&barrier[..], [128, 1, 1], "s_barrier"),
+        (&lds[..], [128, 1, 1], "LDS"),
+    ] {
+        let t = tr(code, threads);
+        assert!(t.complete(), "{threads:?} ({why}): {:?}", t.unsupported_why);
+        assert_eq!((t.dispatch_ratio, t.dispatch_dim), (1, 0), "{threads:?} ({why})");
+    }
+    // the indirect-dispatch fallback: `no_remap` forces the un-remapped form (console group size,
+    // spin kept) even for a wave-local program, so a console-group dispatch is correct
+    let opt = Options { mode: Mode::Compute(cs([128, 1, 1])), wave64: true, split_wave64: true, no_remap: true, ..Default::default() };
+    let t = translate(&store, &opt).unwrap();
+    assert!(t.complete(), "{:?}", t.unsupported_why);
+    assert_eq!((t.dispatch_ratio, t.dispatch_dim), (1, 0), "no_remap must not remap");
+    assert!(t.hlsl.contains("numthreads(128, 1, 1)"), "console group size kept");
+    assert!(t.hlsl.contains("#define XCL_X_SPIN 1"), "spin kept for the fallback");
 }
 
 /// What the split wave64 form costs (`cargo test --release -- --ignored bench_split_wave64
@@ -7358,7 +7423,7 @@ fn gpu_compute_tg_size_counts_a_partial_last_wave() {
         assert!(t.complete(), "{:?}", t.unsupported_why);
         // `XCL_DIRECT_DXIL=1`: the direct translator's kernel, which sets up TG_SIZE on its own
         let dxil = direct_or(&p, &opt, super::dxc::compile(&t.hlsl, "main", "cs_6_6", &[]).unwrap_or_else(|e| panic!("{e}\n{}", t.hlsl)));
-        let mem = runner::dispatch(&dxil, [1, 1, 1], &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
+        let mem = runner::dispatch_r(&dxil, [1, 1, 1], t.dispatch_ratio, t.dispatch_dim as usize, &[0u32; 128], &vec![0xFFFF_FFFFu32; threads as usize]).unwrap();
         let waves = threads.div_ceil(lanes);
         for (k, &got) in mem.iter().take(threads as usize).enumerate() {
             assert_eq!(got, waves | (k as u32 / lanes) << 6, "{threads} threads, wave{lanes}: thread {k}");

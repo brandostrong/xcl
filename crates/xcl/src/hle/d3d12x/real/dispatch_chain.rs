@@ -191,13 +191,32 @@ unsafe fn scratch_buffer(dev: &ID3D12Device, bytes: u64) -> Option<ID3D12Resourc
     resource
 }
 
+/// hardware group counts for a wave-local remapped dispatch: the console `grid` with
+/// `grid[dim]` × `ratio`
+fn hw_grid(grid: [u32; 3], ratio: u32, dim: u32) -> [u32; 3] {
+    let mut g = grid;
+    if ratio > 1 {
+        if let Some(s) = g.get_mut(dim as usize) {
+            *s = s.saturating_mul(ratio);
+        }
+    }
+    g
+}
+
 /// Called with the original six ABI views bound. The extended signature is
 /// common to every piece and the whole fallback. Choose before recording any
 /// part of the dispatch, including when scratch allocation fails.
 pub(in crate::hle::d3d12x) unsafe fn dispatch(list: &ID3D12GraphicsCommandList, pso: usize, allocator: usize, grid: [u32; 3]) -> Result<(), String> {
     let [x, y, z] = grid;
     let chain = CHAINS.lock().unwrap().get(&pso).cloned();
-    let Some(chain) = chain else { list.Dispatch(x, y, z); return Ok(()) };
+    let Some(chain) = chain else {
+        // a wave-local remapped program (no chain: the HLSL path): the hardware group is one
+        // console wave, so launch `ratio` hardware groups per console group along `dim`
+        let (r, d) = super::pso_dispatch_ratio(pso);
+        let g = hw_grid([x, y, z], r, d);
+        list.Dispatch(g[0], g[1], g[2]);
+        return Ok(())
+    };
     if grid.contains(&0) { return Ok(()); }
     // A title Reset can switch to a different PC allocator while this
     // recording is still submitted on the old one. Retain by backing.

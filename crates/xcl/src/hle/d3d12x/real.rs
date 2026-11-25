@@ -1844,6 +1844,10 @@ fn forget_pso(pso: usize) {
     if let Some(m) = PSO_USER_SGPRS.lock().unwrap().as_mut() {
         m.remove(&pso);
     }
+    if let Some(m) = PSO_DISPATCH_RATIO.lock().unwrap().as_mut() {
+        m.remove(&pso);
+    }
+    remap_fallback::forget(pso);
     super::device_x::forget_base(pso);
     // the compute pass goes with the last user of its entry (`Drop for TwoPassPso`)
     let gone = TWO_PASS.lock().unwrap().as_mut().and_then(|m| m.remove(&pso));
@@ -3878,11 +3882,28 @@ fn note_pso_rs(pso: *mut c_void, rs: *mut c_void) {
 /// user SGPRs of the console CS of a translated compute pipeline
 static PSO_USER_SGPRS: Mutex<Option<HashMap<usize, u32>>> = Mutex::new(None);
 
+/// wave-local remap of a translated compute pipeline: (hardware groups per console group, the
+/// console dimension it scales); `(1, 0)` when not remapped
+static PSO_DISPATCH_RATIO: Mutex<Option<HashMap<usize, (u32, u32)>>> = Mutex::new(None);
+
 /// How many user SGPRs the console compute shader of a translated pipeline has (None: not
 /// known). What is above the driver's four holds root arguments (`console_list::inline_for`).
 pub fn pso_user_sgprs(pso: usize) -> Option<u32> {
     let pso = super::pso_async::resolve(pso);
     PSO_USER_SGPRS.lock().unwrap().as_ref()?.get(&pso).copied()
+}
+
+/// The wave-local remap dispatch scale of a translated compute pipeline: `(ratio, dim)`, or
+/// `(1, 0)` when not remapped. The runtime scales `dim` by `ratio` at `dispatch_chain::dispatch`.
+pub fn pso_dispatch_ratio(pso: usize) -> (u32, u32) {
+    let pso = super::pso_async::resolve(pso);
+    PSO_DISPATCH_RATIO.lock().unwrap().as_ref().and_then(|m| m.get(&pso).copied()).unwrap_or((1, 0))
+}
+
+fn note_pso_dispatch_ratio(pso: *mut c_void, ratio: u32, dim: u32) {
+    if ratio > 1 && !pso.is_null() {
+        PSO_DISPATCH_RATIO.lock().unwrap().get_or_insert_with(HashMap::new).insert(pso as usize, (ratio, dim));
+    }
 }
 
 /// The root signature a translated pipeline state was created with.
@@ -4343,6 +4364,7 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
             if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
                 PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
             }
+            note_pso_dispatch_ratio(*ppv, compiled.dispatch_ratio, compiled.dispatch_dim);
             note_translated_compute(0, ppv);
             TRANSLATED_PSO.fetch_add(1, Ordering::Relaxed);
             return Some(Ok(0));
@@ -4375,6 +4397,8 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
     if let Some(n) = crate::gpu::recomp::pso::compute_user_sgprs(cs) {
         PSO_USER_SGPRS.lock().unwrap().get_or_insert_with(HashMap::new).insert(*ppv as usize, n);
     }
+    note_pso_dispatch_ratio(*ppv, compiled.dispatch_ratio, compiled.dispatch_dim);
+    remap_fallback::note(*ppv as usize, this, f, rs as usize, d.Flags, d.NodeMask, record, cs, wave32_only(this), compiled.dispatch_ratio);
     note_translated_compute(hr, ppv);
     crate::xlog_info!(
         "D3D12.X: compute PSO with the translated console CS ({} B DXIL, {} ms{})",
@@ -4387,6 +4411,68 @@ unsafe fn translated_compute_pso_once(this: *mut c_void, f: PsoFn, desc: *const 
 
 pub(super) mod dispatch_chain;
 pub(crate) use dispatch_chain::log_counts as log_dispatch_chain_counts;
+
+/// The un-remapped PSO a wave-local remapped compute pipeline falls back to when it is
+/// indirect-dispatched: `ExecuteIndirect` reads group counts from the title's buffer on the GPU,
+/// so the CPU remap ratio cannot scale them and the remapped (one-console-wave-per-group) form
+/// would under-dispatch. Built from the same console program with `no_remap` (spin kept, console
+/// group size), so a console-group dispatch is correct. Built lazily on the first indirect hit.
+pub(super) mod remap_fallback {
+    use super::*;
+    use crate::gpu::recomp::pso::console_dxil_noremap;
+    use std::sync::{Arc, LazyLock, OnceLock};
+
+    struct Fallback {
+        this: usize,
+        create: PsoFn,
+        rs: usize,
+        flags: D3D12_PIPELINE_STATE_FLAGS,
+        node: u32,
+        record: u64,
+        cs: Vec<u8>,
+        split_wave64: bool,
+        pso: OnceLock<ID3D12PipelineState>,
+        build: Mutex<()>,
+    }
+
+    static FALLBACKS: LazyLock<Mutex<HashMap<usize, Arc<Fallback>>>> = LazyLock::new(Default::default);
+
+    /// Stash what the fallback needs for a remapped pipeline (`ratio > 1`); the PSO is not built yet.
+    pub(super) fn note(pso: usize, this: *mut c_void, create: PsoFn, rs: usize, flags: D3D12_PIPELINE_STATE_FLAGS,
+        node: u32, record: u64, cs: &[u8], split_wave64: bool, ratio: u32) {
+        if ratio > 1 && pso != 0 {
+            FALLBACKS.lock().unwrap().insert(pso, Arc::new(Fallback {
+                this: this as usize, create, rs, flags, node, record, cs: cs.to_vec(), split_wave64,
+                pso: OnceLock::new(), build: Mutex::new(()),
+            }));
+        }
+    }
+
+    /// The un-remapped PSO for a remapped pipeline, built once on first use.
+    pub(in crate::hle::d3d12x) unsafe fn whole(pso: usize) -> Result<ID3D12PipelineState, String> {
+        let fb = FALLBACKS.lock().unwrap().get(&pso).cloned().ok_or("no remap fallback for the pipeline")?;
+        if let Some(p) = fb.pso.get() {
+            return Ok(p.clone());
+        }
+        let _guard = fb.build.lock().unwrap();
+        if let Some(p) = fb.pso.get() {
+            return Ok(p.clone());
+        }
+        let dxil = console_dxil_noremap(&fb.cs, fb.split_wave64).map_err(|e| format!("remap fallback translate: {e}"))?;
+        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC { NodeMask: fb.node, Flags: fb.flags, ..Default::default() };
+        let iid = pc_iid(Kind::PipelineState);
+        let mut raw: *mut c_void = std::ptr::null_mut();
+        let (hr, _, _) = compute_container(fb.this as *mut c_void, fb.create, &desc, fb.rs as *mut c_void, &dxil, fb.record, &iid, &mut raw, false);
+        let p = (hr >= 0 && !raw.is_null()).then(|| ID3D12PipelineState::from_raw(raw)).ok_or("remap fallback pipeline")?;
+        let _ = fb.pso.set(p.clone());
+        Ok(p)
+    }
+
+    pub(super) fn forget(pso: usize) {
+        let gone = FALLBACKS.lock().unwrap().remove(&pso);
+        drop(gone);
+    }
+}
 
 /// `chained`: built with the dispatch chain's root signature (`dispatch_chain`), whose driver blobs
 /// are kept apart on disk from the same DXIL's under the title's.

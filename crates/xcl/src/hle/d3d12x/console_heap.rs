@@ -169,16 +169,19 @@ pub unsafe fn shared_heap(dev: &ID3D12Device) -> bool {
             }
         };
         crate::xlog_info!("console descriptor heaps: one shader-visible PC heap of {cap} view descriptors for all of them");
-        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV));
+        let inc = dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+        null_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, inc);
+        null_window_views(dev, heap.GetCPUDescriptorHandleForHeapStart().ptr as u64, inc);
         *g = Some(Global {
             dev: dev.clone(),
             cpu: heap.GetCPUDescriptorHandleForHeapStart().ptr as u64,
             gpu: heap.GetGPUDescriptorHandleForHeapStart().ptr,
-            inc: dev.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
+            inc,
             heap,
             cap,
-            // the memory windows' raw UAVs (`set_window_views`) come first
-            next: crate::gpu::recomp::MEM_HEAP_BASE + crate::gpu::uma::MAX_HEAP_WINDOWS as u32,
+            // the memory windows' raw UAVs (`set_window_views`) come first, then the two null
+            // window descriptors (`null_window_views`); general allocation starts after them
+            next: crate::gpu::recomp::MEM_NULL_STORE + 1,
             free: Vec::new(),
         });
     }
@@ -211,6 +214,15 @@ unsafe fn null_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
 }
 
 static WINDOW_VIEWS_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Null raw UAVs at `MEM_NULL_LOAD` / `MEM_NULL_STORE` (just past the window slots): out-of-window
+/// heap accesses are redirected there (`mem_accessors`); a null-resource UAV reads 0 and discards writes.
+unsafe fn null_window_views(dev: &ID3D12Device, cpu: u64, inc: u32) {
+    for idx in [crate::gpu::recomp::MEM_NULL_LOAD, crate::gpu::recomp::MEM_NULL_STORE] {
+        let at = D3D12_CPU_DESCRIPTOR_HANDLE { ptr: (cpu + idx as u64 * inc as u64) as usize };
+        dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&crate::gpu::recomp::runner::raw_window_uav(4)), at);
+    }
+}
 
 /// Whether the memory windows could not be put in the shared heap (`set_window_views`):
 /// translated shaders then switch over root UAVs (`pso::heap_windows`).

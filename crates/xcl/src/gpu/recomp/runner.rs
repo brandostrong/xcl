@@ -1532,7 +1532,7 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1543,6 +1543,12 @@ fn run_in_region(dxil: &[u8], state: &KernelState, arena: &Arena) -> Result<Kern
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(b, None::<&ID3D12Resource>, Some(&raw_window_uav(size as u64)), h);
+        }
+        // null window descriptors: out-of-window heap accesses are redirected here (`mem_accessors`)
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
         }
         list.SetDescriptorHeaps(&[Some(dh.clone())]);
         list.SetComputeRootSignature(&gpu.rs);
@@ -1607,6 +1613,12 @@ pub fn try_create_texture(desc: &D3D12_RESOURCE_DESC) -> Result<(), String> {
 /// A compute shader with the console dispatch ABI (`Mode::Compute`): `groups` thread groups,
 /// u0 = user SGPRs, u2 = flat memory. Returns the memory afterwards.
 pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
+    dispatch_r(dxil, groups, 1, 0, sgprs, mem)
+}
+
+/// `dispatch` for a wave-local remapped program: launches `ratio` hardware groups per console
+/// group along `dim` (`Translation`'s `dispatch_ratio` / `dispatch_dim`); `groups` stay console units.
+pub fn dispatch_r(dxil: &[u8], groups: [u32; 3], ratio: u32, dim: usize, sgprs: &[u32], mem: &[u32]) -> Result<Vec<u32>, String> {
     let mut g = GPU.lock().unwrap();
     let gpu = g.get_or_insert_with(init).as_mut().map_err(|x| x.clone())?;
     let pso: ID3D12PipelineState = unsafe {
@@ -1617,7 +1629,15 @@ pub fn dispatch(dxil: &[u8], groups: [u32; 3], sgprs: &[u32], mem: &[u32]) -> Re
         })
     }
     .map_err(|x| format!("CreateComputePipelineState: {x}"))?;
-    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, groups, sgprs, mem, 1, false, None).map(|(m, _)| m)
+    let hw = scaled(groups, ratio, dim);
+    dispatch_with(&gpu.dev, &gpu.queue, &gpu.fence, &mut gpu.value, &pso, &gpu.rs, hw, sgprs, mem, 1, false, None).map(|(m, _)| m)
+}
+
+/// hardware group counts for a remapped dispatch: `groups` (console) with `groups[dim]` × `ratio`
+fn scaled(groups: [u32; 3], ratio: u32, dim: usize) -> [u32; 3] {
+    let mut g = groups;
+    g[dim] = g[dim].saturating_mul(ratio);
+    g
 }
 
 #[cfg(test)]
@@ -1723,7 +1743,7 @@ fn dispatch_with(
         let dh: ID3D12DescriptorHeap = dev
             .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                NumDescriptors: super::MEM_HEAP_BASE + win_count as u32,
+                NumDescriptors: (super::MEM_HEAP_BASE + win_count as u32).max(super::MEM_NULL_STORE + 1),
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
                 NodeMask: 0,
             })
@@ -1733,6 +1753,12 @@ fn dispatch_with(
             let mut h = dh.GetCPUDescriptorHandleForHeapStart();
             h.ptr += (super::MEM_HEAP_BASE as usize + k) * inc;
             dev.CreateUnorderedAccessView(&mem_buf, None::<&ID3D12Resource>, Some(&raw_window_uav(mem_bytes)), h);
+        }
+        // null window descriptors for out-of-window heap accesses (`mem_accessors`)
+        for idx in [super::MEM_NULL_LOAD, super::MEM_NULL_STORE] {
+            let mut h = dh.GetCPUDescriptorHandleForHeapStart();
+            h.ptr += idx as usize * inc;
+            dev.CreateUnorderedAccessView(None::<&ID3D12Resource>, None::<&ID3D12Resource>, Some(&raw_window_uav(4)), h);
         }
         list.SetDescriptorHeaps(&[Some(dh.clone()), Some(bound._heaps[1].clone())]);
         list.SetComputeRootSignature(rs);

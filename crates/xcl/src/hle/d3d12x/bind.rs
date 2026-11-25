@@ -315,6 +315,20 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
     match bind_abi(this, list, pso, gfx) {
         Ok(()) => {
             if compute {
+                // a wave-local remapped program dispatched indirectly: its group counts come from
+                // the title's buffer on the GPU, so the CPU ratio cannot scale them – run the
+                // un-remapped form (console group size, spin kept), built lazily for this pipeline
+                if super::real::pso_dispatch_ratio(pso).0 > 1 {
+                    match super::real::remap_fallback::whole(pso) {
+                        Ok(fb) => list.SetPipelineState(&fb),
+                        Err(e) => {
+                            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if N.fetch_add(1, Ordering::Relaxed) < 4 {
+                                crate::xlog_warn!("D3D12.X: ExecuteIndirect with a wave-local remapped pipeline ({pso:#x}): {e}");
+                            }
+                        }
+                    }
+                }
                 match super::real::dispatch_chain::whole(pso) {
                     Ok(Some(whole)) => list.SetPipelineState(&whole),
                     Ok(None) => {}
